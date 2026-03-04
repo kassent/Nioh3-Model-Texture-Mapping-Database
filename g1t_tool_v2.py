@@ -423,6 +423,26 @@ def parse_texture_index_from_dds_name(name: str) -> Optional[int]:
     return None
 
 
+def parse_layer_index_from_dds_name(name: str) -> Optional[int]:
+    # Accept both stems and full filenames:
+    #   0x2D86652D.TEX0.L0.bc7.dds
+    #   0x2D86652D.TEX0.L0
+    candidates = [
+        name,
+        os.path.splitext(name)[0],
+    ]
+    patterns = [
+        r"\.L\s*(\d+)(?:\.|$)",
+        r"(?:^|[_-])L\s*(\d+)(?:\.|$)",
+    ]
+    for cand in candidates:
+        for pat in patterns:
+            m = re.search(pat, cand, flags=re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+    return None
+
+
 def g1t_compute_total_layers(load_type: int, ex_array: int) -> int:
     if load_type == LOAD_PLANAR:
         layers = 1
@@ -546,6 +566,53 @@ def reorder_slice_major_to_mip_major(data: bytes, mip_sizes: Sequence[int], slic
     for m in range(len(mip_sizes)):
         for s in range(slices):
             out.extend(chunks[m][s])
+    return bytes(out)
+
+
+def extract_slice_from_mip_major(data: bytes, mip_sizes: Sequence[int], slices: int, layer: int) -> bytes:
+    if layer < 0 or layer >= slices:
+        raise ValueError("Layer index out of range: {} (slices={})".format(layer, slices))
+    need = sum(ms * slices for ms in mip_sizes)
+    if len(data) < need:
+        raise ValueError("Texture payload shorter than expected for slice extraction")
+    out = bytearray()
+    offs = 0
+    for ms in mip_sizes:
+        start = offs + layer * ms
+        out.extend(data[start:start + ms])
+        offs += ms * slices
+    return bytes(out)
+
+
+def merge_slice_into_mip_major(
+    base_data: bytes,
+    layer_data: bytes,
+    mip_sizes: Sequence[int],
+    slices: int,
+    layer: int,
+) -> bytes:
+    if layer < 0 or layer >= slices:
+        raise ValueError("Layer index out of range: {} (slices={})".format(layer, slices))
+
+    full_need = sum(ms * slices for ms in mip_sizes)
+    layer_need = sum(mip_sizes)
+
+    if len(layer_data) < layer_need:
+        raise ValueError("Layer DDS payload shorter than expected")
+
+    out = bytearray(base_data)
+    if len(out) < full_need:
+        out.extend(b"\x00" * (full_need - len(out)))
+
+    src = layer_data[:layer_need]
+    src_offs = 0
+    dst_offs = 0
+    for ms in mip_sizes:
+        start = dst_offs + layer * ms
+        out[start:start + ms] = src[src_offs:src_offs + ms]
+        src_offs += ms
+        dst_offs += ms * slices
+
     return bytes(out)
 
 
@@ -1315,7 +1382,7 @@ def parse_dds(path: str) -> DdsImage:
     )
 
 
-def build_dds(tex: TextureEntry) -> bytes:
+def build_dds(tex: TextureEntry, layer: Optional[int] = None) -> bytes:
     dxgi_fmt = tex.dxgi_format()
     info = DXGI_INFO[dxgi_fmt]
 
@@ -1326,9 +1393,23 @@ def build_dds(tex: TextureEntry) -> bytes:
     src_is_volume = tex.is_3d_texture()
     is_volume = src_is_volume
     depth = tex.depth if src_is_volume else 1
-    slices = tex.slice_count_for_dds() if not src_is_volume else 1
+    force_dx10_header = False
 
-    data = tex.image_data
+    if layer is not None:
+        if src_is_volume:
+            raise ValueError("Layer export is not supported for volume textures")
+        if tex.load_type != LOAD_PLANE_ARRAY:
+            raise ValueError("Layer export is only supported for PLANE_ARRAY textures")
+        total_slices = tex.slice_count_for_dds()
+        mip_sizes = mip_sizes_2d(dxgi_fmt, width, height, mip_count)
+        data = extract_slice_from_mip_major(tex.image_data, mip_sizes, total_slices, layer)
+        slices = 1
+        # Keep per-layer DDS in DX10 form for better editor compatibility.
+        force_dx10_header = True
+    else:
+        slices = tex.slice_count_for_dds() if not src_is_volume else 1
+        data = tex.image_data
+
     if src_is_volume:
         expected = calc_total_size_3d(dxgi_fmt, width, height, depth, mip_count)
     else:
@@ -1344,7 +1425,7 @@ def build_dds(tex: TextureEntry) -> bytes:
     if (not src_is_volume) and slices > 1:
         data = reorder_mip_major_to_slice_major(data, mip_sizes_2d(dxgi_fmt, width, height, mip_count), slices)
 
-    use_legacy = (slices == 1 and not src_is_volume and dxgi_fmt in DXGI_TO_LEGACY_FOURCC)
+    use_legacy = (not force_dx10_header) and (slices == 1 and not src_is_volume and dxgi_fmt in DXGI_TO_LEGACY_FOURCC)
 
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
     caps = DDSCAPS_TEXTURE
@@ -1431,15 +1512,46 @@ def export_g1t_file(
     count = 0
     for tex in g.textures:
         dxgi_fmt = tex.dxgi_format()
+        fmt_name = DXGI_INFO.get(dxgi_fmt).name if dxgi_fmt in DXGI_INFO else "DXGI_{}".format(dxgi_fmt)
+        load_name = LOAD_TYPE_NAMES.get(tex.load_type, "UNKNOWN")
+        layer_count = g1t_compute_total_layers(tex.load_type, tex.ex_array()) * max(1, tex.ex_faces() or 1)
+
+        if tex.load_type == LOAD_PLANE_ARRAY:
+            slices = tex.slice_count_for_dds()
+            layer_data_size = calc_total_size_2d(dxgi_fmt, tex.width, tex.height, tex.mip_count, 1)
+            for layer in range(slices):
+                out_name = "{}.TEX{}.L{}{}".format(base, tex.index, layer, dxgi_extension(dxgi_fmt))
+                out_path = os.path.join(out_dir, out_name)
+                dds = build_dds(tex, layer=layer)
+                with open(out_path, "wb") as fp:
+                    fp.write(dds)
+                if verbose:
+                    print(
+                        "    TEX{idx}.L{layer} {w}x{h} fmt={fmt} mips={mips} layers={layers} depth={depth} "
+                        "loadtype={load}({load_id}) size={size} -> {name}".format(
+                            idx=tex.index,
+                            layer=layer,
+                            w=tex.width,
+                            h=tex.height,
+                            fmt=fmt_name,
+                            mips=tex.mip_count,
+                            layers=layer_count,
+                            depth=tex.depth,
+                            load=load_name,
+                            load_id=tex.load_type,
+                            size=format_size_human(layer_data_size),
+                            name=out_name,
+                        )
+                    )
+                count += 1
+            continue
+
         out_name = "{}.TEX{}{}".format(base, tex.index, dxgi_extension(dxgi_fmt))
         out_path = os.path.join(out_dir, out_name)
         dds = build_dds(tex)
         with open(out_path, "wb") as fp:
             fp.write(dds)
         if verbose:
-            fmt_name = DXGI_INFO.get(dxgi_fmt).name if dxgi_fmt in DXGI_INFO else "DXGI_{}".format(dxgi_fmt)
-            load_name = LOAD_TYPE_NAMES.get(tex.load_type, "UNKNOWN")
-            layer_count = g1t_compute_total_layers(tex.load_type, tex.ex_array()) * max(1, tex.ex_faces() or 1)
             print(
                 "    TEX{idx} {w}x{h} fmt={fmt} mips={mips} layers={layers} depth={depth} "
                 "loadtype={load}({load_id}) size={size} -> {name}".format(
@@ -1582,6 +1694,99 @@ def apply_dds_to_texture(tex: TextureEntry, dds: DdsImage, strict_streaming: boo
     tex.image_data = new_pixels
 
 
+def apply_layer_dds_to_plane_array_texture(
+    tex: TextureEntry,
+    layer_to_dds_path: Dict[int, str],
+    strict_streaming: bool,
+) -> None:
+    if tex.load_type != LOAD_PLANE_ARRAY:
+        raise ValueError("Layer DDS import is only supported for PLANE_ARRAY textures")
+
+    slices = tex.slice_count_for_dds()
+    if slices <= 0:
+        raise ValueError("Invalid PLANE_ARRAY slice count")
+
+    invalid_layers = sorted([layer for layer in layer_to_dds_path.keys() if layer < 0 or layer >= slices])
+    if invalid_layers:
+        raise ValueError("Layer index out of range: {}".format(invalid_layers))
+
+    missing_layers = [layer for layer in range(slices) if layer not in layer_to_dds_path]
+    if missing_layers:
+        raise ValueError("Missing layer DDS files: {}".format(missing_layers))
+
+    old_dxgi = tex.dxgi_format()
+    first_dds: Optional[DdsImage] = None
+    loaded_by_layer: Dict[int, DdsImage] = {}
+
+    for layer in range(slices):
+        dds = parse_dds(layer_to_dds_path[layer])
+        if dds.is_volume:
+            raise ValueError("Layer DDS must be non-volume")
+        if dds.slice_count != 1:
+            raise ValueError("Layer DDS must be single-slice")
+        if first_dds is None:
+            first_dds = dds
+        else:
+            if dds.dxgi_format != first_dds.dxgi_format:
+                raise ValueError("Layer DDS DXGI format mismatch")
+            if dds.width != first_dds.width or dds.height != first_dds.height:
+                raise ValueError("Layer DDS dimensions mismatch")
+            if dds.mip_count != first_dds.mip_count:
+                raise ValueError("Layer DDS mip count mismatch")
+        loaded_by_layer[layer] = dds
+
+    if first_dds is None:
+        raise ValueError("No layer DDS provided")
+
+    if first_dds.dxgi_format == old_dxgi:
+        new_format_id = tex.format_id
+    else:
+        if first_dds.dxgi_format not in DXGI_TO_G1T_CANONICAL:
+            raise ValueError("DDS DXGI format {} cannot map to G1T format".format(first_dds.dxgi_format))
+        new_format_id = DXGI_TO_G1T_CANONICAL[first_dds.dxgi_format]
+
+    new_width = first_dds.width
+    new_height = first_dds.height
+    new_mips = first_dds.mip_count
+    new_depth = tex.depth
+
+    mip_sizes = mip_sizes_2d(first_dds.dxgi_format, new_width, new_height, new_mips)
+    layer_payload_need = sum(mip_sizes)
+    full_payload_need = layer_payload_need * slices
+
+    # Build full mip-major payload from per-layer DDS files.
+    new_pixels = b"\x00" * full_payload_need
+    for layer in range(slices):
+        dds = loaded_by_layer[layer]
+        if len(dds.pixel_data) < layer_payload_need:
+            raise ValueError("Layer {} DDS payload shorter than expected".format(layer))
+        new_pixels = merge_slice_into_mip_major(
+            new_pixels,
+            dds.pixel_data[:layer_payload_need],
+            mip_sizes,
+            slices,
+            layer,
+        )
+
+    if strict_streaming:
+        # Keep g1ts stream metadata stable: no structural changes.
+        if new_format_id != tex.format_id:
+            raise ValueError("G1TS import requires same format")
+        if new_width != tex.width or new_height != tex.height:
+            raise ValueError("G1TS import requires same dimensions")
+        if new_mips != tex.mip_count:
+            raise ValueError("G1TS import requires same mip count")
+        if len(new_pixels) != len(tex.image_data):
+            raise ValueError("G1TS import requires same pixel data size")
+
+    tex.format_id = new_format_id
+    tex.width = new_width
+    tex.height = new_height
+    tex.depth = new_depth
+    tex.mip_count = new_mips
+    tex.image_data = new_pixels
+
+
 def import_for_file(g1t_path: str, input_root: str, output_root: str) -> Tuple[bool, List[str]]:
     logs: List[str] = []
 
@@ -1599,6 +1804,7 @@ def import_for_file(g1t_path: str, input_root: str, output_root: str) -> Tuple[b
         return False, logs
 
     idx_to_dds: Dict[int, str] = {}
+    idx_to_layer_dds: Dict[int, Dict[int, str]] = {}
 
     for dds_path in candidates:
         fn = os.path.basename(dds_path)
@@ -1614,23 +1820,52 @@ def import_for_file(g1t_path: str, input_root: str, output_root: str) -> Tuple[b
         if idx < 0 or idx >= len(g.textures):
             logs.append("skip {} (index {} out of range)".format(fn, idx))
             continue
+        layer = parse_layer_index_from_dds_name(noext)
+        if layer is not None:
+            layer_map = idx_to_layer_dds.setdefault(idx, {})
+            if layer in layer_map:
+                logs.append("skip {} (TEX{} layer {} already has candidate)".format(fn, idx, layer))
+                continue
+            layer_map[layer] = dds_path
+            continue
+
         if idx in idx_to_dds:
             logs.append("skip {} (texture {} already has candidate)".format(fn, idx))
             continue
-
         idx_to_dds[idx] = dds_path
 
-    if not idx_to_dds:
+    if not idx_to_dds and not idx_to_layer_dds:
         logs.append("no valid DDS mapped to textures")
         return False, logs
 
     changed = False
 
-    for idx in sorted(idx_to_dds.keys()):
-        dds_path = idx_to_dds[idx]
+    target_indices = sorted(set(idx_to_dds.keys()) | set(idx_to_layer_dds.keys()))
+    for idx in target_indices:
         tex = g.textures[idx]
         strict_streaming = tex.is_streaming
+        layer_map = idx_to_layer_dds.get(idx, {})
 
+        if layer_map:
+            if tex.load_type != LOAD_PLANE_ARRAY:
+                logs.append(
+                    "skip TEX{} (layer DDS provided but load_type is {})".format(
+                        idx, LOAD_TYPE_NAMES.get(tex.load_type, "UNKNOWN")
+                    )
+                )
+                continue
+            try:
+                apply_layer_dds_to_plane_array_texture(tex, layer_map, strict_streaming)
+                changed = True
+                logs.append("apply TEX{} <- {} layer file(s)".format(idx, len(layer_map)))
+            except Exception as exc:
+                logs.append("skip TEX{} layer import ({})".format(idx, exc))
+            continue
+
+        if idx not in idx_to_dds:
+            continue
+
+        dds_path = idx_to_dds[idx]
         try:
             dds = parse_dds(dds_path)
             apply_dds_to_texture(tex, dds, strict_streaming)
